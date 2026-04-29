@@ -20,13 +20,318 @@
 </head>
 <body>
 <script type="module">
-    import {ThreeEngine} from "./js/utils/utils_three.js";
+    import {ThreeEngine, get_default_lil_gui, refresh_displays} from "./js/utils/utils_three.js";
+    import {identity_matrix, mul_matrix_matrix, normalized_matrix, frobenius_norm_matrix, add_matrix_matrix, mul_matrix_scalar, sub_matrix_matrix, transpose, matrix_inverse_3x3} from "./js/utils/utils_math.js";
+    import {XArm7Robot} from "./js/utils/utils_robot.js";
+    import {TransformGizmoEngine} from "./js/utils/utils_transform_gizmo.js";
+    import {optimization_solve} from "./js/utils/utils_optimization.js";
 
     let engine = ThreeEngine.new_default_3d();
 
-    engine.animation_loop( ()  => {
+    let robot = new XArm7Robot();
 
+    let links = robot.links;
+    let joints = robot.joints;
+    let kh = robot.kinematic_hierarchy;
+
+    robot.spawn_robot(engine);
+
+    let gizmo = new TransformGizmoEngine(engine);
+    let gizmo_idx = gizmo.add_gizmo_SE3_matrix(engine);
+
+    let gui = get_default_lil_gui();
+
+    let settings = {
+        mesh_visible: true,
+        wireframe_visible: false,
+        display_mesh_only_with_frame: false,
+        continuous_solves: true
+    }
+    gui.add(settings, 'mesh_visible').name('Display Mesh');
+    gui.add(settings, 'wireframe_visible').name('Display Wireframe');
+    gui.add(settings, 'display_mesh_only_with_frame').name('Display Mesh only with Frame');
+    gui.add(settings, 'continuous_solves').name('Continuous solves');
+
+    let dofs = [];
+    let link_names = [];
+
+    let actions = {
+        solve_now: solve,
+        reset: reset,
+        toggle_gizmo: function() {
+            gizmo.toggle_mode();
+        },
+        select_all: function() {
+            link_names.forEach(link_name => settings[link_name] = true);
+            refresh_displays(gui);
+        },
+        deselect_all: function() {
+            link_names.forEach(link_name => settings[link_name] = false);
+            refresh_displays(gui);
+        }
+    };
+
+    gui.add(actions, 'solve_now').name('Solve now');
+    gui.add(actions, 'reset').name('Reset');
+    gui.add(actions, 'toggle_gizmo').name('Toggle transform gizmo mode');
+
+    let dofs_folder = gui.addFolder('DOFs');
+    let actions_folder = gui.addFolder('Actions');
+    let links_folder = gui.addFolder('Links');
+
+    joints.forEach(joint => {
+        if (joint.joint_type_string === 'revolute' || joint.joint_type_string === 'prismatic') {
+            let default_value;
+            if (joint.lower_bound <= 0 && 0 <= joint.upper_bound) {
+                default_value = 0;
+            } else {
+                default_value = Math.abs(joint.lower_bound) < Math.abs(joint.upper_bound) ? joint.lower_bound : joint.upper_bound;
+            }
+            if (joint.dof_idx === 2) {
+                default_value = -1.571;
+            }
+            settings[joint.dof_idx] = default_value;
+            dofs_folder.add(settings, joint.dof_idx, joint.lower_bound, joint.upper_bound).name(`dof${joint.dof_idx}`).disable();
+            dofs.push([joint.dof_idx, default_value]);
+        } else if (joint.joint_type_string === 'floating') {
+            joint.rotation_dof_idxs.forEach((dof_idx) => {
+                settings[dof_idx] = 0;
+                dofs_folder.add(settings, dof_idx, -3.14, 3.14).name(`dof${dof_idx}`).disable();
+                dofs.push([dof_idx, 0]);
+            });
+            joint.translation_dof_idxs.forEach((dof_idx) => {
+                settings[dof_idx] = 0;
+                dofs_folder.add(settings, dof_idx, -1, 1).name(`dof${dof_idx}`).disable();
+                dofs.push([dof_idx, 0]);
+            });
+        }
     });
+
+    links.forEach(link => {
+        settings[link.link_name] = false;
+        links_folder.add(settings, link.link_name).name(`link ${link.link_idx}: ${link.link_name}`);
+        link_names.push(link.link_name);
+    });
+
+    actions_folder.add(actions, 'select_all').name('Select All Frames');
+    actions_folder.add(actions, 'deselect_all').name('Deselect All Frames');
+
+    reset();
+
+    function get_dof_values() {
+        let dof_values = [];
+        for (let i = 0; i < dofs.length; i++) {
+            dof_values.push(settings[i]);
+        }
+        return dof_values;
+    }
+
+    function fk(dof_values) {
+        // Compute SE(3) poses of each link
+        let output_poses = [];
+        for (let i = 0; i < links.length; i++) {
+            output_poses.push(identity_matrix(4));
+        }
+
+        kh.forEach(layer => {
+            layer.forEach(link_idx => {
+                if (link_idx !== 0) {
+                    let curr_link = links[link_idx];
+                    let parent_link_idx = curr_link.parent_link_idx;
+                    let parent_joint_idx = curr_link.parent_joint_idx;
+                    let curr_joint = joints[parent_joint_idx];
+                    let joint_type = curr_joint.joint_type_string;
+
+                    let curr_pose = output_poses[parent_link_idx];
+                    let T_c = curr_joint.xyz_rpy_SE3_matrix;
+                    curr_pose = mul_matrix_matrix(curr_pose, T_c);
+
+                    let T_v;
+                    if (joint_type === 'fixed') {
+                        T_v = identity_matrix(4);
+                    } else if (joint_type === 'revolute') {
+                        let joint_value = dof_values[curr_joint.dof_idx];
+                        let axis = normalized_matrix(curr_joint.axis);
+                        let exp_A = exp_so3(joint_value * axis[0][0], joint_value * axis[1][0], joint_value * axis[2][0]);
+
+                        T_v = [
+                            [exp_A[0][0], exp_A[0][1], exp_A[0][2], 0],
+                            [exp_A[1][0], exp_A[1][1], exp_A[1][2], 0],
+                            [exp_A[2][0], exp_A[2][1], exp_A[2][2], 0],
+                            [0, 0, 0, 1]
+                        ];
+                    } else if (joint_type === 'prismatic') {
+                        let joint_value = dof_values[curr_joint.dof_idx];
+                        let axis = normalized_matrix(curr_joint.axis);
+
+                        T_v = [
+                            [1, 0, 0, joint_value * axis[0][0]],
+                            [0, 1, 0, joint_value * axis[1][0]],
+                            [0, 0, 1, joint_value * axis[2][0]],
+                            [0, 0, 0, 1]
+                        ];
+                    } else if (joint_type === 'floating') {
+                        let rd = curr_joint.rotation_dof_idxs;
+                        let td = curr_joint.translation_dof_idxs;
+
+                        let exp_A = exp_so3(dof_values[rd[0]], dof_values[rd[1]], dof_values[rd[2]]);
+
+                        T_v = [
+                            [exp_A[0][0], exp_A[0][1], exp_A[0][2], dof_values[td[0]]],
+                            [exp_A[1][0], exp_A[1][1], exp_A[1][2], dof_values[td[1]]],
+                            [exp_A[2][0], exp_A[2][1], exp_A[2][2], dof_values[td[2]]],
+                            [0, 0, 0, 1]
+                        ];
+                    }
+
+                    curr_pose = mul_matrix_matrix(curr_pose, T_v);
+
+                    output_poses[link_idx] = curr_pose;
+                }
+            });
+        });
+
+        return output_poses;
+    }
+
+    function reset() {
+        dofs.forEach(dof => settings[dof[0]] = dof[1]);
+        let dof_values = get_dof_values();
+        let output_poses = fk(dof_values);
+        gizmo.set_pose_of_gizmo_SE3_matrix(gizmo_idx, output_poses[19]);
+        refresh_displays(gui);
+    }
+
+    function set_poses(output_poses) {
+        links.forEach(link => {
+            let m = output_poses[link.link_idx];
+            robot.set_link_mesh_pose_from_SE3_matrix(engine, link.link_idx, m);
+
+            if (settings[link.link_name]) {
+                // Compute endpoints of vectors
+                let o_augmented = mul_matrix_matrix(m, [[0], [0], [0], [1]]);
+                let o = [[o_augmented[0][0]], [o_augmented[1][0]], [o_augmented[2][0]]];
+                let x_augmented = mul_matrix_matrix(m, [[0.05], [0], [0], [1]]);
+                let x = [[x_augmented[0][0]], [x_augmented[1][0]], [x_augmented[2][0]]];
+                let y_augmented = mul_matrix_matrix(m, [[0], [0.05], [0], [1]]);
+                let y = [[y_augmented[0][0]], [y_augmented[1][0]], [y_augmented[2][0]]];
+                let z_augmented = mul_matrix_matrix(m, [[0], [0], [0.05], [1]]);
+                let z = [[z_augmented[0][0]], [z_augmented[1][0]], [z_augmented[2][0]]];
+
+                engine.draw_debug_line(o, x, true, 0.002, 0xff3333);
+                engine.draw_debug_line(o, y, true, 0.002, 0x33ff33);
+                engine.draw_debug_line(o, z, true, 0.002, 0x1768eb);
+            }
+        });
+    }
+
+    function solve() {
+        let curr_dof_values = get_dof_values();
+        let gizmo_position = gizmo.get_gizmo_pose_as_SE3_matrix(gizmo_idx);
+
+        // Function to optimize
+        function f(dof_values) {
+            let output_poses = fk(dof_values);
+            let output_pose = output_poses[19];
+            return disp_dist_se3_squared(output_pose, gizmo_position);
+        }
+
+        let new_dof_values = optimization_solve(f, curr_dof_values);
+        for (let i = 0; i < new_dof_values.length; i++) {
+            settings[i] = new_dof_values[i];
+        }
+        let new_output_poses = fk(new_dof_values);
+        set_poses(new_output_poses);
+
+        refresh_displays(gui);
+    }
+
+    engine.animation_loop( ()  => {
+        if (settings.continuous_solves) {
+            solve();
+        }
+
+        // Set visibility
+        if (settings.display_mesh_only_with_frame) {
+            links.forEach(link => {
+                robot.set_link_mesh_visibility(engine, link.link_idx, settings[link.link_name] && settings.mesh_visible);
+                robot.set_link_wireframe_visibility(engine, link.link_idx, settings[link.link_name] && settings.wireframe_visible);
+            });
+        } else {
+            robot.set_mesh_visibility(engine, settings.mesh_visible);
+            robot.set_wireframe_visibility(engine, settings.wireframe_visible);
+        }
+    });
+
+    function exp_so3(a, b, c) {
+        let A = [
+            [0, -c, b],
+            [c, 0, -a],
+            [-b, a, 0]
+        ];
+
+        let u = [[a], [b], [c]];
+        let beta = frobenius_norm_matrix(u);
+
+        let p;
+        let q;
+        if (beta < 0.0001) {
+            p = 1 - (beta**2 / 6) + (beta**4 / 120);
+            q = (1 / 2) - (beta**2 / 24) + (beta**4 / 720);
+        } else {
+            p = Math.sin(beta) / beta;
+            q = (1 - Math.cos(beta)) / (beta**2);
+        }
+
+        return add_matrix_matrix(add_matrix_matrix(identity_matrix(3), mul_matrix_scalar(A, p)), mul_matrix_scalar(mul_matrix_matrix(A, A), q));
+    }
+
+    function disp_dist_se3_squared(m1, m2) {
+        let disp = mul_matrix_matrix(math.inv(m1), m2);
+        // First compute A = ln(R), where R is the SO(3) submatrix of the disp SE(3) matrix
+        let R = [
+            [disp[0][0], disp[0][1], disp[0][2]],
+            [disp[1][0], disp[1][1], disp[1][2]],
+            [disp[2][0], disp[2][1], disp[2][2]]
+        ];
+        let A;
+        let beta = Math.acos((R[0][0] + R[1][1] + R[2][2] - 1) / 2);
+        if (Math.abs(beta) < 0.0001) {
+            A = mul_matrix_scalar(sub_matrix_matrix(R, transpose(R)), (1 / 2) + (beta**2 / 12) + (7 * (beta**4) / 720));
+        } else if (Math.abs(beta - Math.PI) < 0.0001) {
+            A = [
+                [0, -Math.PI * Math.sqrt((1 / 2) * (R[2][2] + 1)), Math.PI * Math.sqrt((1 / 2) * (R[1][1] + 1))],
+                [Math.PI * Math.sqrt((1 / 2) * (R[2][2] + 1)), 0, -Math.PI * Math.sqrt((1 / 2) * (R[0][0] + 1))],
+                [-Math.PI * Math.sqrt((1 / 2) * (R[1][1] + 1)), Math.PI * Math.sqrt((1 / 2) * (R[0][0] + 1)), 0]
+            ];
+        } else {
+            A = mul_matrix_scalar(sub_matrix_matrix(R, transpose(R)), beta / (2 * Math.sin(beta)));
+        }
+        // a1, a2, and a3 can be extracted from A = ln(R)
+        let a1 = A[2][1];
+        let a2 = A[0][2];
+        let a3 = A[1][0];
+        // Then compute b = C^-1 t, where t is the translation subvector of the disp SE(3) matrix
+        let t = [[disp[0][3]], [disp[1][3]], [disp[2][3]]];
+        beta = Math.sqrt(a1 ** 2 + a2 ** 2 + a3 ** 2);
+        let p;
+        let q;
+        if (Math.abs(beta) < 0.0001) {
+            p = (1 / 2) - (beta**2 / 24) + (beta**4 / 720);
+            q = (1 / 6) - (beta**2 / 120) + (beta**4 / 5040);
+        } else {
+            p = (1 - Math.cos(beta)) / (beta**2);
+            q = (beta - Math.sin(beta)) / (beta**3);
+        }
+        let C = add_matrix_matrix(add_matrix_matrix(identity_matrix(3), mul_matrix_scalar(A, p)), mul_matrix_scalar(mul_matrix_matrix(A, A), q));
+        let b = mul_matrix_matrix(matrix_inverse_3x3(C), t);
+        // a4, a5, and a6 can be extracted from b = C^-1 t
+        let a4 = b[0][0];
+        let a5 = b[1][0];
+        let a6 = b[2][0];
+        // Compute distance squared
+        return a1 ** 2 + a2 ** 2 + a3 ** 2 + a4 ** 2 + a5 ** 2 + a6 ** 2;
+    }
 
 </script>
 </body>
